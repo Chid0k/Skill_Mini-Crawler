@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+output.json
+output/
+*.swp
+*.swo
+.env
+.vscode/settings.json
+dist/
+coverage/

@@ -1,0 +1,34 @@
+{
+  "name": "browserless-crawler",
+  "version": "1.0.0",
+  "description": "High-performance web crawler with API discovery using Browserless/Puppeteer",
+  "main": "index.js",
+  "bin": {
+    "crawler": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "docker:build": "docker build -t browserless-crawler .",
+    "docker:run": "docker run --rm -v \"$(pwd)/output:/app/output\" browserless-crawler",
+    "docker:up": "docker compose up",
+    "docker:down": "docker compose down"
+  },
+  "keywords": [
+    "crawler",
+    "browserless",
+    "puppeteer",
+    "api-discovery",
+    "web-scraping"
+  ],
+  "author": "AI Agents",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "puppeteer": "^21.0.0",
+    "commander": "^11.0.0",
+    "cli-progress": "^3.12.0",
+    "chalk": "^4.1.2"
+  }
+}

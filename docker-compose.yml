@@ -1,0 +1,32 @@
+services:
+
+  # ── Browserless Chrome ───────────────────────────────────────────────────
+  # Headless Chrome as a service — the crawler connects to it via WebSocket.
+  # This avoids bundling a full browser inside the crawler image.
+  browserless:
+    image: browserless/chrome:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      MAX_CONCURRENT_SESSIONS: "10"
+      CONNECTION_TIMEOUT: "300000"
+      # Uncomment to require a token for the browserless API:
+      # TOKEN: "your-secret-token"
+
+  # ── Crawler ──────────────────────────────────────────────────────────────
+  crawler:
+    build: .
+    depends_on:
+      - browserless
+    volumes:
+      # Discovered API endpoints are written here on the host
+      - ./output:/app/output
+    environment:
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+    # Pass the target URL and options here (override at runtime with `docker compose run`)
+    # Example: docker compose run --rm crawler https://example.com -d 2 -l 2
+    #
+    # Connects to the browserless service above:
+    #   docker compose run --rm crawler https://example.com -b ws://browserless:3000
+    command: ["--help"]
