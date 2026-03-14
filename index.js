@@ -64,6 +64,8 @@ class ConfigValidator {
     // Feature 2: file type filtering
     config.filterTypes         = ConfigValidator.parseFilterTypes(rawConfig.filter);
     config.hideFiltered        = rawConfig.hideFiltered === true;
+    // Feature 4: exclude path list
+    config.excludePaths        = ConfigValidator.parseExcludePaths(rawConfig.excludePaths);
     // Feature 3: automatic page interaction
     config.enableInteract      = rawConfig.interact !== false;
 
@@ -92,6 +94,26 @@ class ConfigValidator {
       .map(s => s.trim().toLowerCase())
       .map(s => CATEGORY_MAP[s] || s)
       .filter(Boolean);
+  }
+
+  /**
+   * Parse --exclude-paths flag: comma-separated paths or URLs to block.
+   * Matching is prefix-based against URL pathname.
+   */
+  static parseExcludePaths(value) {
+    if (!value) return [];
+    const normalize = (raw) => {
+      let p = String(raw || '').trim();
+      if (!p) return null;
+      try {
+        if (/^https?:\/\//i.test(p)) p = new URL(p).pathname;
+      } catch (_) {}
+      if (!p.startsWith('/')) p = '/' + p;
+      p = p.replace(/\*+$/, '');
+      if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+      return p || '/';
+    };
+    return [...new Set(value.split(',').map(normalize).filter(Boolean))];
   }
 
   static validateUrl(url) {
@@ -213,6 +235,11 @@ class ApiSignatureRegistry {
       this._mergedCount++;
       const existing = this._signatures.get(signature);
       existing.mergeCount = (existing.mergeCount || 1) + 1;
+      if (endpoint.source && endpoint.source !== existing.source) {
+        const variants = Array.isArray(existing.sourceVariants) ? existing.sourceVariants : [];
+        if (existing.source) variants.push(existing.source);
+        existing.sourceVariants = [...new Set([...variants, endpoint.source])];
+      }
       return false; // duplicate
     }
     endpoint.mergeCount = 1;
@@ -250,6 +277,7 @@ class NetworkMonitor extends EventEmitter {
     this._registry        = new ApiSignatureRegistry();
     this._filteredCount   = 0;
     this._filterSet       = new Set(options.filterTypes || []);
+    this._excludePaths    = new Set(options.excludePaths || []);
     this._hideFiltered    = options.hideFiltered || false;
   }
 
@@ -260,11 +288,11 @@ class NetworkMonitor extends EventEmitter {
    * Called by CrawlerEngine before each page navigation.
    * @param {import('puppeteer').Page} page
    */
-  async attachToPage(page) {
+  async attachToPage(page, getSourceContext = null) {
     await page.setRequestInterception(true);
-    page.on('request',         (req) => this._onRequest(req));
+    page.on('request',         (req) => this._onRequest(req, getSourceContext));
     page.on('requestfinished', (req) => this._onRequestFinished(req));
-    page.on('requestfailed',   (req) => this._pendingRequests.delete(req.url()));
+    page.on('requestfailed',   (req) => this._pendingRequests.delete(req));
   }
 
   /** Return a copy of every unique ApiEndpoint collected so far. */
@@ -299,10 +327,47 @@ class NetworkMonitor extends EventEmitter {
     return TRACKING.some((re) => re.test(urlString));
   }
 
+  _isExcludedPath(urlString) {
+    return this._getBlockedPathReason(urlString) !== null;
+  }
+
+  _getBlockedPathReason(urlString) {
+    if (this._isSessionRiskPath(urlString)) return 'session_protection';
+    if (!this._excludePaths.size) return null;
+    try {
+      const { pathname } = new URL(urlString, 'http://x');
+      const path = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+      for (const blocked of this._excludePaths) {
+        if (path === blocked || path.startsWith(blocked + '/')) return 'exclude_paths';
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _isSessionRiskPath(urlString) {
+    try {
+      const parsed = new URL(urlString, 'http://x');
+      const full = `${parsed.pathname}${parsed.search}`.toLowerCase();
+      if (/(^|\/)(log-?out|sign-?out|log-?off|sign-?off)(\/|$|\.|\?)/.test(full)) return true;
+      if (/(^|[?&])(action|do|op)=log-?out([&#]|$)/.test(parsed.search.toLowerCase())) return true;
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   // ── Request phase ─────────────────────────────────────────────────────────
 
-  _onRequest(request) {
+  _onRequest(request, getSourceContext = null) {
     const resourceType = request.resourceType();
+
+    if (this._getBlockedPathReason(request.url())) {
+      this._filteredCount++;
+      request.abort().catch(() => {});
+      return;
+    }
 
     if (!this._isRelevantType(resourceType) || this._isTrackingUrl(request.url())) {
       this._filteredCount++;
@@ -317,13 +382,14 @@ class NetworkMonitor extends EventEmitter {
       return;
     }
 
-    this._pendingRequests.set(request.url(), {
+    this._pendingRequests.set(request, {
       method:       request.method(),
       url:          request.url(),
       resourceType,
       headers:      this._extractImportantHeaders(request.headers()),
       params:       this._parseQueryParams(request.url()),
       body:         this._parseBody(request.postData(), request.headers()),
+      source:       this._resolveSourceContext(request, getSourceContext),
     });
 
     request.continue();
@@ -332,10 +398,10 @@ class NetworkMonitor extends EventEmitter {
   // ── Response phase ────────────────────────────────────────────────────────
 
   async _onRequestFinished(request) {
-    const requestData = this._pendingRequests.get(request.url());
+    const requestData = this._pendingRequests.get(request);
     if (!requestData) return;
 
-    this._pendingRequests.delete(request.url());
+    this._pendingRequests.delete(request);
 
     const response = request.response();
     if (!response) return;
@@ -462,10 +528,60 @@ class NetworkMonitor extends EventEmitter {
     if (Object.keys(requestData.headers).length)                      endpoint.headers = requestData.headers;
     if (responseSchema)                                                endpoint.response_schema = responseSchema;
     else if (responseBody)                                             endpoint.response_body_snippet = responseBody;
+    if (requestData.source)                                            endpoint.source = requestData.source;
 
     endpoint.notes       = this._generateNotes(requestData.method, status, parsedUrl);
     endpoint.discoveredAt = new Date().toISOString();
     return endpoint;
+  }
+
+  _resolveSourceContext(request, getSourceContext) {
+    const sourceData = typeof getSourceContext === 'function' ? getSourceContext() : null;
+    const frameUrl = (request.frame() && request.frame().url()) || request.url();
+    const fallback = this._labelFromUrl(frameUrl);
+    const pages = sourceData && typeof sourceData === 'object' && Array.isArray(sourceData.pageViews)
+      ? sourceData.pageViews.filter((v) => typeof v === 'string' && v.trim()).slice(-2)
+      : [fallback];
+    const normalizedPages = pages.length >= 2 ? pages : [pages[0], pages[0]];
+    const actionLabel = sourceData && typeof sourceData.action === 'string' && sourceData.action.trim()
+      ? sourceData.action.trim()
+      : 'Page View';
+    const actionType = sourceData && typeof sourceData.actionType === 'string' && sourceData.actionType.trim()
+      ? sourceData.actionType.trim()
+      : 'page_view';
+    const trigger = sourceData && typeof sourceData.trigger === 'string' && sourceData.trigger.trim()
+      ? sourceData.trigger.trim()
+      : undefined;
+    const pageUrl = sourceData && typeof sourceData.currentPageUrl === 'string' && sourceData.currentPageUrl.trim()
+      ? sourceData.currentPageUrl.trim()
+      : frameUrl;
+    const pagePath = this._toRelativePath(pageUrl);
+    const meta = [`type=${actionType}`, `page=${pagePath}`];
+    if (trigger) meta.push(`trigger=${trigger}`);
+    return `Page flow: ${normalizedPages.join(' -> ')} | Action: ${actionLabel} (${meta.join(', ')})`;
+  }
+
+  _labelFromUrl(urlString) {
+    try {
+      const parsed = new URL(urlString, 'http://x');
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      const raw = parts.length ? parts[parts.length - 1] : 'home';
+      return this._humanizeLabel(raw.replace(/\.[a-z0-9]+$/i, '')) || 'Home';
+    } catch (_) {
+      return 'Page';
+    }
+  }
+
+  _humanizeLabel(text) {
+    const cleaned = decodeURIComponent(String(text || ''))
+      .replace(/[-_]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!cleaned) return '';
+    return cleaned
+      .split(' ')
+      .map((word) => (word ? word[0].toUpperCase() + word.slice(1) : word))
+      .join(' ');
   }
 
   _toRelativePath(urlString) {
@@ -621,6 +737,11 @@ class PageInteractor {
         const key = `expand:${item.text}`;
         if (this._interacted.has(key)) continue;
         try {
+          emitFn('interactionStarted', {
+            action: this._actionLabel('Expand', item.text, 'Section'),
+            actionType: 'interaction',
+            trigger: this._triggerLabel('expand', item.text, 'section'),
+          });
           await page.evaluate((sel, idx) => {
             const el = document.querySelectorAll(sel)[idx];
             if (el) { el.scrollIntoView({ block: 'center' }); el.click(); }
@@ -657,6 +778,11 @@ class PageInteractor {
           const key = `select:${sel.name}:${opt.val}`;
           if (this._interacted.has(key)) continue;
           try {
+            emitFn('interactionStarted', {
+              action: this._actionLabel('Change', sel.name, 'Selection'),
+              actionType: 'interaction',
+              trigger: this._triggerLabel('select', sel.name, 'selection'),
+            });
             await page.evaluate((sIdx, optIdx) => {
               const s = document.querySelectorAll('select')[sIdx];
               if (!s) return;
@@ -713,6 +839,11 @@ class PageInteractor {
         const key = `btn:${btn.text}:${btn.tag}`;
         if (this._interacted.has(key)) continue;
         try {
+          emitFn('interactionStarted', {
+            action: this._actionLabel('Click', btn.text, 'Button'),
+            actionType: 'interaction',
+            trigger: this._triggerLabel('button', btn.text, 'button'),
+          });
           await page.evaluate((sel, idx) => {
             const el = document.querySelectorAll(sel)[idx];
             if (el) { el.scrollIntoView({ block: 'center' }); el.click(); }
@@ -752,6 +883,11 @@ class PageInteractor {
         const formKey = `form:${form.action}:${form.inputs.map(i => i.name).sort().join(',')}`;
         if (this._interacted.has(formKey)) continue;
         try {
+          emitFn('interactionStarted', {
+            action: this._formActionLabel(form),
+            actionType: 'interaction',
+            trigger: this._triggerLabel('form', form.action || form.method, 'form-submit'),
+          });
           const fillMap = this._fillMap;
           await page.evaluate((formData, fillMap) => {
             const form = document.querySelectorAll('form')[formData.index];
@@ -822,6 +958,11 @@ class PageInteractor {
         const key = `loadmore:${btn.text}`;
         if (this._interacted.has(key)) continue;
         try {
+          emitFn('interactionStarted', {
+            action: this._actionLabel('Click', btn.text, 'Load More Button'),
+            actionType: 'interaction',
+            trigger: this._triggerLabel('load-more', btn.text, 'load-more'),
+          });
           await page.evaluate((idx) => {
             const el = Array.from(document.querySelectorAll(
               'button, a, [role="button"], input[type="button"]'
@@ -839,6 +980,32 @@ class PageInteractor {
   }
 
   getTotalInteractions() { return this._totalInteractions; }
+
+  _actionLabel(verb, text, fallback) {
+    const label = String(text || '').trim().replace(/\s+/g, ' ').substring(0, 80);
+    return `${verb} ${label || fallback}`;
+  }
+
+  _triggerLabel(prefix, text, fallback) {
+    const clean = String(text || fallback || '')
+      .trim()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-zA-Z0-9-_]/g, '')
+      .toLowerCase()
+      .substring(0, 60);
+    return `${prefix}:${clean || fallback}`;
+  }
+
+  _formActionLabel(form) {
+    const fieldNames = (form.inputs || []).map((i) => String(i.name || '').toLowerCase());
+    const hasUserField = fieldNames.some((name) => /user|email|login/.test(name));
+    const hasPassField = fieldNames.some((name) => /pass|pwd/.test(name));
+    const combined = `${form.action || ''} ${fieldNames.join(' ')}`.toLowerCase();
+    if (/(login|log[-_\s]?in|sign[-_\s]?in)/.test(combined) || (hasUserField && hasPassField)) {
+      return 'Submit Login Button';
+    }
+    return `Submit ${(form.method || 'FORM').toUpperCase()} Form`;
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -879,6 +1046,9 @@ class Logger {
     if (config.authHeader)    console.log(chalk.gray('  Auth:      ') + chalk.green('✓ Configured'));
     if (config.filterTypes && config.filterTypes.length)
       console.log(chalk.gray('  Filter:    ') + chalk.yellow(config.filterTypes.join(', ')));
+    if (config.excludePaths && config.excludePaths.length)
+      console.log(chalk.gray('  Exclude:   ') + chalk.yellow(config.excludePaths.join(', ')));
+    console.log(chalk.gray('  Session:   ') + chalk.cyan('✓ Logout-path protection enabled'));
     if (config.enableInteract)
       console.log(chalk.gray('  Interact:  ') + chalk.cyan('✓ Auto page interaction enabled'));
     console.log('');
@@ -928,6 +1098,9 @@ class Logger {
     const method = this._colorMethod(endpoint.method);
     const status = this._colorStatus(endpoint.status);
     this.logBelow(`  ${chalk.magenta('⚡')} ${method} ${chalk.white(endpoint.url)} ${status}`);
+    if (endpoint.source) {
+      this.logBelow(chalk.gray(`      ↳ source: ${this._truncateUrl(endpoint.source, 95)}`));
+    }
     this.updateProgress();
   }
 
@@ -1304,6 +1477,7 @@ class CrawlerEngine extends EventEmitter {
       headless:           config.headless !== false,
       authHeader:         config.authHeader || null,
       loginCredentials:   config.loginCredentials || null,
+      excludePaths:       config.excludePaths || [],
       ...config,
     };
 
@@ -1392,7 +1566,9 @@ class CrawlerEngine extends EventEmitter {
           const lu = new URL(link);
           if (lu.hostname === baseUrl.hostname) {
             const norm = this.normalizeUrl(link);
-            if (!this.visited.has(norm)) result.push({ url: norm, depth: currentDepth + 1 });
+            if (!this.visited.has(norm) && !this._isPathExcluded(norm)) {
+              result.push({ url: norm, depth: currentDepth + 1 });
+            }
           }
         } catch (_) { /* invalid URL */ }
       }
@@ -1414,12 +1590,90 @@ class CrawlerEngine extends EventEmitter {
     }
   }
 
-  async visitPage(url, depth) {
+  _isPathExcluded(url) {
+    return this._getPathBlockReason(url) !== null;
+  }
+
+  _getPathBlockReason(url) {
+    if (this._isSessionRiskPath(url)) return 'session_protection';
+    const list = this.config.excludePaths || [];
+    if (!list.length) return null;
+    try {
+      const { pathname } = new URL(url);
+      const path = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+      return list.some((blocked) => path === blocked || path.startsWith(blocked + '/'))
+        ? 'exclude_paths'
+        : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _isSessionRiskPath(url) {
+    try {
+      const parsed = new URL(url);
+      const full = `${parsed.pathname}${parsed.search}`.toLowerCase();
+      if (/(^|\/)(log-?out|sign-?out|log-?off|sign-?off)(\/|$|\.|\?)/.test(full)) return true;
+      if (/(^|[?&])(action|do|op)=log-?out([&#]|$)/.test(parsed.search.toLowerCase())) return true;
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _cleanPageLabel(text) {
+    if (typeof text !== 'string') return '';
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    return normalized ? normalized.substring(0, 80) : '';
+  }
+
+  _labelFromUrl(url) {
+    try {
+      const parsed = new URL(url);
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      const raw = parts.length ? parts[parts.length - 1].replace(/\.[a-z0-9]+$/i, '') : 'Home';
+      const clean = decodeURIComponent(raw).replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+      return clean ? clean.split(' ').map((w) => w[0].toUpperCase() + w.slice(1)).join(' ') : 'Home';
+    } catch (_) {
+      return 'Page';
+    }
+  }
+
+  _buildCurrentPageViews(pageChain, currentUrl) {
+    const cleanChain = Array.isArray(pageChain)
+      ? pageChain.filter((item) => typeof item === 'string' && item.trim()).slice(-2)
+      : [];
+    if (cleanChain.length > 0) return cleanChain;
+    return [this._labelFromUrl(currentUrl)];
+  }
+
+  _buildChildPageViews(parentPageViews, childUrl) {
+    const parent = Array.isArray(parentPageViews)
+      ? parentPageViews.filter((item) => typeof item === 'string' && item.trim()).slice(-1)
+      : [];
+    const child = this._labelFromUrl(childUrl);
+    return [...parent, child];
+  }
+
+  async visitPage(url, depth, pageChain = []) {
     let page = null;
     try {
+      const blockReason = this._getPathBlockReason(url);
+      if (blockReason) {
+        this.emit('pathExcluded', { url, depth, reason: blockReason });
+        return;
+      }
+
       page = await this.browser.newPage();
       await page.setViewport(this.config.viewport);
       await page.setUserAgent(this.config.userAgent);
+      const sourceState = {
+        pageViews: this._buildCurrentPageViews(pageChain, url),
+        actionLabel: 'Page View',
+        actionType: 'page_view',
+        trigger: 'navigation',
+        currentPageUrl: url,
+      };
 
       if (depth === 0) {
         await this.authenticate(page);
@@ -1447,7 +1701,15 @@ class CrawlerEngine extends EventEmitter {
         } catch (_) {}
       });
 
-      if (this.networkMonitor) await this.networkMonitor.attachToPage(page);
+      if (this.networkMonitor) {
+        await this.networkMonitor.attachToPage(page, () => ({
+          pageViews: [...sourceState.pageViews],
+          action: sourceState.actionLabel,
+          actionType: sourceState.actionType,
+          trigger: sourceState.trigger,
+          currentPageUrl: sourceState.currentPageUrl,
+        }));
+      }
 
       this.emit('navigating', { url, depth });
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
@@ -1455,22 +1717,51 @@ class CrawlerEngine extends EventEmitter {
       this.visited.add(this.normalizeUrl(url));
       this.stats.pagesVisited++;
 
-      this.emit('onPageLoad', { url, depth, title: await page.title(), visited: this.stats.pagesVisited });
+      const pageTitle = await page.title();
+      sourceState.currentPageUrl = page.url() || sourceState.currentPageUrl;
+      const cleanTitle = this._cleanPageLabel(pageTitle);
+      if (cleanTitle) {
+        sourceState.pageViews = sourceState.pageViews.length > 1
+          ? [...sourceState.pageViews.slice(0, -1), cleanTitle]
+          : [cleanTitle];
+      }
+      sourceState.actionLabel = 'Page View';
+      sourceState.actionType = 'page_view';
+      sourceState.trigger = 'page-load';
+      this.emit('onPageLoad', { url, depth, title: pageTitle, visited: this.stats.pagesVisited });
 
       // Probe REST APIs and fire in-browser fetches (captured by NetworkMonitor)
+      sourceState.actionLabel = 'Auto API Probe';
+      sourceState.actionType = 'system';
+      sourceState.trigger = 'api-prober';
       await this.apiProber.probe(
         page, url,
         (queueUrl, queueDepth) => {
           const norm = this.normalizeUrl(queueUrl);
-          if (!this.visited.has(norm)) this.queue.push({ url: norm, depth: queueDepth });
+          if (!this.visited.has(norm) && !this._getPathBlockReason(norm)) {
+            this.queue.push({
+              url: norm,
+              depth: queueDepth,
+              pageChain: this._buildChildPageViews(sourceState.pageViews, norm),
+            });
+          }
         },
         depth, this.config.maxDepth
       );
       await this._waitForQuiet(page, 2000);
+      sourceState.actionLabel = 'Page View';
+      sourceState.actionType = 'page_view';
+      sourceState.trigger = 'idle';
 
       // Feature 3: interact with page to trigger additional requests
       if (this.interactor) {
         const interacted = await this.interactor.interact(page, (event, data) => {
+          if (event === 'interactionStarted') {
+            sourceState.actionLabel = data && data.action ? data.action : 'Action';
+            sourceState.actionType = data && data.actionType ? data.actionType : 'interaction';
+            sourceState.trigger = data && data.trigger ? data.trigger : 'manual';
+            return;
+          }
           this.emit(event, data);
         });
         if (interacted > 0) {
@@ -1487,14 +1778,25 @@ class CrawlerEngine extends EventEmitter {
           const u = new URL(spaUrl);
           if (u.hostname === baseHostname) {
             const norm = this.normalizeUrl(u.toString());
-            if (!this.visited.has(norm) && depth + 1 <= this.config.maxDepth)
-              this.queue.push({ url: norm, depth: depth + 1 });
+            if (!this.visited.has(norm) && !this._getPathBlockReason(norm) && depth + 1 <= this.config.maxDepth)
+              this.queue.push({
+                url: norm,
+                depth: depth + 1,
+                pageChain: this._buildChildPageViews(sourceState.pageViews, norm),
+              });
           }
         } catch (_) {}
       }
 
       const newLinks = await this.extractLinks(page, url, depth);
-      for (const link of newLinks) this.queue.push(link);
+      for (const link of newLinks) {
+        if (!this._getPathBlockReason(link.url)) {
+          this.queue.push({
+            ...link,
+            pageChain: this._buildChildPageViews(sourceState.pageViews, link.url),
+          });
+        }
+      }
       this.emit('linksDiscovered', { count: newLinks.length, depth: depth + 1 });
 
     } catch (error) {
@@ -1528,7 +1830,14 @@ class CrawlerEngine extends EventEmitter {
       await this.initialize();
 
       const startUrl = this.normalizeUrl(this.config.targetUrl);
-      this.queue.push({ url: startUrl, depth: 0 });
+      const startBlockReason = this._getPathBlockReason(startUrl);
+      if (startBlockReason) {
+        const reasonText = startBlockReason === 'session_protection'
+          ? 'session-protection guard'
+          : '--exclude-paths';
+        throw new Error(`Target URL path is blocked by ${reasonText}: ${startUrl}`);
+      }
+      this.queue.push({ url: startUrl, depth: 0, pageChain: [this._labelFromUrl(startUrl)] });
       this.emit('crawlStarted', { targetUrl: this.config.targetUrl, maxDepth: this.config.maxDepth, requestsPerSecond: this.config.requestsPerSecond });
 
       while (this.queue.length > 0 && this.isRunning) {
@@ -1536,7 +1845,14 @@ class CrawlerEngine extends EventEmitter {
         const activeTasks = [];
         for (let i = 0; i < batchSize; i++) {
           const item = this.queue.shift();
-          if (item && !this.visited.has(item.url)) activeTasks.push(this.visitPage(item.url, item.depth));
+          if (item && !this.visited.has(item.url)) {
+            const blockReason = this._getPathBlockReason(item.url);
+            if (blockReason) {
+              this.emit('pathExcluded', { url: item.url, depth: item.depth, reason: blockReason });
+              continue;
+            }
+            activeTasks.push(this.visitPage(item.url, item.depth, item.pageChain));
+          }
         }
         if (activeTasks.length > 0) {
           await Promise.all(activeTasks);
@@ -1594,6 +1910,7 @@ program
   .option('--no-headless',               'Run browser in headed mode (visible)')
   .option('--user-agent <string>',       'Custom User-Agent string')
   .option('--filter <types>',            'Comma-separated resource types to exclude from output (css,js,image,font,media,document,xhr,fetch)')
+  .option('--exclude-paths <paths>',     'Comma-separated path prefixes to block (e.g. /admin,/private,/internal)')
   .option('--hide-filtered',             'Suppress filtered-type requests from real-time log')
   .option('--no-interact',               'Disable automatic page interaction (buttons, forms)')
   .action(run);
@@ -1616,6 +1933,7 @@ async function run(url, options) {
       headless:     options.headless,
       userAgent:    options.userAgent,
       filter:       options.filter,
+      excludePaths: options.excludePaths,
       hideFiltered: options.hideFiltered,
       interact:     options.interact,
     });
@@ -1628,7 +1946,11 @@ async function run(url, options) {
     reporter.initialize(config);
 
     // 4. Instantiate NetworkMonitor and CrawlerEngine
-    const monitor = new NetworkMonitor({ filterTypes: config.filterTypes, hideFiltered: config.hideFiltered });
+    const monitor = new NetworkMonitor({
+      filterTypes: config.filterTypes,
+      hideFiltered: config.hideFiltered,
+      excludePaths: config.excludePaths,
+    });
     const crawler = new CrawlerEngine(config);
 
     // 5. Wire Agent 2 → Agent 3
@@ -1647,6 +1969,10 @@ async function run(url, options) {
     crawler.on('onPageLoad',       (data) => logger.logPageLoad(data));
     crawler.on('linksDiscovered',  (data) => logger.logLinksDiscovered(data.count, data.depth));
     crawler.on('onError',          (data) => logger.logError(data));
+    crawler.on('pathExcluded',     (data) => {
+      const reasonText = data.reason === 'session_protection' ? 'session safeguard' : 'exclude list';
+      logger.logBelow(chalk.yellow(`  ⤫ Skipped (${reasonText}): `) + chalk.gray(logger._truncateUrl(data.url)));
+    });
     crawler.on('pageInteracted',   (data) => {
       logger.logBelow(chalk.cyan(`  🖱️  Interacted with ${data.count} element(s) on `) + chalk.gray(logger._truncateUrl(data.url)));
     });

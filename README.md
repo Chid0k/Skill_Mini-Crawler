@@ -9,6 +9,9 @@ A single-file CLI tool that authenticates, crawls a target website using Puppete
 - **Authentication** — inject headers, bearer tokens, or automate login forms
 - **Request deduplication** — merges identical endpoint signatures
 - **Automatic page interaction** — clicks buttons/dropdowns to trigger lazy-loaded requests
+- **API source attribution** — records where each API call came from (`Page -> Page -> Action`)
+- **Path exclusion list** — blocks crawler/request access to specified path prefixes
+- **Session safety guard** — automatically blocks logout/signout-style paths to avoid session loss
 - **Resource filtering** — exclude CSS, images, fonts, etc. from output
 - **Real-time dashboard** — live progress bar and coloured log stream
 - **Streaming JSON output** — results are appended incrementally (safe on crash)
@@ -38,6 +41,7 @@ node index.js https://example.com -a "Authorization: Bearer mytoken"
 node index.js https://example.com -a mytoken          # → Bearer mytoken
 node index.js https://example.com -a ./creds.json     # JSON credentials file
 node index.js https://example.com -b ws://localhost:3000   # Browserless
+node index.js https://example.com --exclude-paths "/admin,/private,/internal"
 node index.js --help
 ```
 
@@ -54,8 +58,11 @@ node index.js --help
 | `--no-headless` | — | Run browser in headed (visible) mode |
 | `--user-agent <string>` | Mozilla/5.0 | Custom User-Agent |
 | `--filter <types>` | — | Comma-separated resource types to exclude: `css,js,image,font,media` |
+| `--exclude-paths <paths>` | — | Comma-separated path prefixes to block, e.g. `/admin,/private` |
 | `--hide-filtered` | — | Suppress filtered requests from the live log |
 | `--no-interact` | — | Disable automatic page interaction |
+
+> The crawler also applies a built-in session guard and skips logout/signout/logoff paths by default.
 
 ### Output format
 
@@ -66,6 +73,7 @@ node index.js --help
     {
       "method": "GET",
       "url": "/api/v1/users",
+      "source": "Page flow: Dashboard -> Users | Action: Click Search Button (type=interaction, page=/users, trigger=button:search)",
       "status": 200,
       "resourceType": "xhr",
       "params": { "page": "number" },
@@ -76,6 +84,8 @@ node index.js --help
   "summary": { "pagesVisited": 5, "totalApisDiscovered": 12, "duration": "38s" }
 }
 ```
+
+`source` is intentionally self-contained and descriptive: it includes page flow, action label, action type, page path, and trigger in one readable field.
 
 ## Docker
 
